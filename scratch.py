@@ -27,11 +27,14 @@ age_cutoff_seconds = 3600 * 24
 stats = {
     'script': {
         'status_codes': {}},
-    'stock': {}}
-subreddit_list = ['gme']
-subreddit_to_symbol_map = {
-    'gme': 'GME'
+    'subreddit': {}
 }
+subreddit_list = [
+    'amcstock',
+    'gme',
+    'superstonk',
+    'wallstreetbets',
+]
 user_agent = (platform.system() + ' ' + platform.release() + '; '
               + 'reddit_collector/v0.1 (by /u/' + args.user + ')')
 
@@ -69,6 +72,8 @@ else:
 logging.info('Using token %s, last modified %d seconds ago',
     access_token, float(time.time()) - access_token_path.stat().st_mtime)
 
+# Reddit requires capping requests at 1 rps.
+# https://github.com/reddit-archive/reddit/wiki/API#rules
 @limits(calls=1, period=1)
 def do_get(api_url, api_params={}):
     response = requests.get(
@@ -85,38 +90,61 @@ def do_get(api_url, api_params={}):
         stats['script']['status_codes'][response.status_code] = 1
     return response
 
-def process_article_list(response, subreddit_name=None):
+def process_post_list(response, subreddit_name=None):
     response_data = response.json()
     try:
         assert response_data['data']
         assert response_data['data']['children']
-        logging.debug('Processing %s articles', len(response_data['data']['children']))
-        age = 0
-        for article in response_data['data']['children']:
-            age = float(time.time()) - float(article['data']['created_utc'])
-            if age >= age_cutoff_seconds:
+        logging.debug('Processing %s posts', len(response_data['data']['children']))
+        age_seconds = 0
+        for post in response_data['data']['children']:
+            age_seconds = float(time.time()) - float(post['data']['created_utc'])
+            if age_seconds >= age_cutoff_seconds:
                 break
-            if not article['data']['selftext']:
-                logging.debug('created_utc: %s, age: %s, ups: %s, num_comments: %s, num_crossposts: %s, type: url, title: %s',
-                    article['data']['created_utc'],
-                    age,
-                    article['data']['ups'],
-                    article['data']['num_comments'],
-                    article['data']['num_crossposts'],
-                    article['data']['title'])
+            stats['subreddit'][subreddit_name]['_tmp']['authors'].add(post['data']['author'])
+            stats['subreddit'][subreddit_name]['stats']['num_posts'] += 1
+            stats['subreddit'][subreddit_name]['stats']['num_comments'] += int(post['data']['num_comments'])
+            stats['subreddit'][subreddit_name]['stats']['num_crossposts'] += int(post['data']['num_crossposts'])
+            stats['subreddit'][subreddit_name]['stats']['num_ups'] += int(post['data']['ups'])
+            stats['subreddit'][subreddit_name]['_tmp']['sum_age_seconds'] += age_seconds
+            if not post['data']['selftext']:
+                stats['subreddit'][subreddit_name]['stats']['num_urls'] += 1
+                logging.debug('created_utc: %s, age_seconds: %f, ups: %s, num_comments: %s, num_crossposts: %s, type: url, title: %s',
+                    post['data']['created_utc'],
+                    age_seconds,
+                    post['data']['ups'],
+                    post['data']['num_comments'],
+                    post['data']['num_crossposts'],
+                    post['data']['title'])
             else:
-                logging.debug('created_utc: %s, age: %s, ups: %s, num_comments: %s, num_crossposts: %s, type: selftext, title: %s',
-                    article['data']['created_utc'],
-                    age,
-                    article['data']['ups'],
-                    article['data']['num_comments'],
-                    article['data']['num_crossposts'],
-                    article['data']['title'])
-        return None if age > age_cutoff_seconds else response_data['data']['after']
+                stats['subreddit'][subreddit_name]['stats']['num_selftexts'] += 1
+                logging.debug('created_utc: %s, age_seconds: %f, ups: %s, num_comments: %s, num_crossposts: %s, type: selftext, title: %s',
+                    post['data']['created_utc'],
+                    age_seconds,
+                    post['data']['ups'],
+                    post['data']['num_comments'],
+                    post['data']['num_crossposts'],
+                    post['data']['title'])
+        return None if age_seconds == 0 or age_seconds > age_cutoff_seconds else response_data['data']['after']
     except Exception as exc:
         logging.error(traceback.format_exc())
 
 for subreddit_name in subreddit_list:
+    stats['subreddit'][subreddit_name] = {
+        '_tmp': {
+            'authors': set(),
+            'sum_age_seconds': 0
+        },
+        'stats': {
+            'avg_age_seconds': 0,
+            'num_posts': 0,
+            'num_comments': 0,
+            'num_crossposts': 0,
+            'num_selftexts': 0,
+            'num_ups': 0,
+            'num_urls': 0,
+        }
+    }
     after = None
     api_url = 'https://oauth.reddit.com/r/' + subreddit_name + '/new'
     paginate_enabled = True
@@ -126,8 +154,14 @@ for subreddit_name in subreddit_list:
             api_params['after'] = after
         response = do_get(api_url, api_params=api_params)
         if response.status_code == 200:
-            after = process_article_list(response, subreddit_name=subreddit_name)
+            after = process_post_list(response, subreddit_name=subreddit_name)
             if after is None:
                 paginate_enabled = False
-logging.info('Script stats: %s', stats['script'])
-logging.info('Stock stats: %s', stats['stock'])
+    stats['subreddit'][subreddit_name]['stats']['avg_age_seconds'] = (
+        stats['subreddit'][subreddit_name]['_tmp']['sum_age_seconds'] / stats['subreddit'][subreddit_name]['stats']['num_posts'])
+    stats['subreddit'][subreddit_name]['stats']['num_authors'] = len(
+        stats['subreddit'][subreddit_name]['_tmp']['authors'])
+    del stats['subreddit'][subreddit_name]['_tmp']
+
+logging.debug('Script stats:\n%s', pprint.pformat(stats['script']))
+logging.debug('Subreddit stats:\n%s', pprint.pformat(stats['subreddit']))
