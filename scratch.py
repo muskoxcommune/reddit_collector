@@ -2,6 +2,7 @@
 from ratelimit import limits  # https://pypi.org/project/ratelimit
 
 import argparse
+import copy
 import json
 import logging
 import pathlib
@@ -21,6 +22,7 @@ argparser.add_argument('--id', required=True, help='app client ID')
 argparser.add_argument('--password', required=True, help='reddit development user password')
 argparser.add_argument('--secret', required=True, help='app client secret')
 argparser.add_argument('--user', required=True, help='reddit development user')
+argparser.add_argument('subreddit', nargs='+', help='subreddit to craw')
 args = argparser.parse_args()
 
 age_cutoff_seconds = 3600 * 24
@@ -29,12 +31,15 @@ stats = {
         'status_codes': {}},
     'subreddit': {}
 }
-subreddit_list = [
-    'amcstock',
-    'gme',
-    'superstonk',
-    'wallstreetbets',
-]
+subreddit_stats_template = {
+    'avg_age_seconds': 0,
+    'num_posts': 0,
+    'num_comments': 0,
+    'num_crossposts': 0,
+    'num_selftexts': 0,
+    'num_ups': 0,
+    'num_urls': 0,
+}
 user_agent = (platform.system() + ' ' + platform.release() + '; '
               + 'reddit_collector/v0.1 (by /u/' + args.user + ')')
 
@@ -129,21 +134,13 @@ def process_post_list(response, subreddit_name=None):
     except Exception as exc:
         logging.error(traceback.format_exc())
 
-for subreddit_name in subreddit_list:
+for subreddit_name in args.subreddit:
     stats['subreddit'][subreddit_name] = {
         '_tmp': {
             'authors': set(),
             'sum_age_seconds': 0
         },
-        'stats': {
-            'avg_age_seconds': 0,
-            'num_posts': 0,
-            'num_comments': 0,
-            'num_crossposts': 0,
-            'num_selftexts': 0,
-            'num_ups': 0,
-            'num_urls': 0,
-        }
+        'stats': copy.deepcopy(subreddit_stats_template)
     }
     after = None
     api_url = 'https://oauth.reddit.com/r/' + subreddit_name + '/new'
