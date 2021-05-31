@@ -11,7 +11,6 @@ import pprint
 import requests
 import time
 import traceback
-import uuid
 
 access_token_filename = '/tmp/reddit.token.json'
 access_token_path = pathlib.Path(access_token_filename)
