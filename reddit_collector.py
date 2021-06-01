@@ -173,14 +173,15 @@ if not out_dir_path.exists():
 
 sorted_subreddits = sorted(stats['subreddit'].keys())
 for stat_name in subreddit_stats_template.keys():
-    logging.info('Generating TSV for subreddit %s', stat_name)
     stat_file_filename = args.out_dir + '/subreddit.' + stat_name + '.tsv'
-    stat_file_path = pathlib.Path(stat_file_filename)
+    logging.info('Generating %s stats in %s', stat_name, stat_file_filename)
 
     data = []
     for subreddit_name in sorted_subreddits:
         data.append(stats['subreddit'][subreddit_name]['stats'][stat_name])
     serialized_data = '\t'.join([datetime.now(timezone.utc).strftime('%m/%d/%Y %H:%M:%S')] + [str(value) for value in data]) + '\n'
+
+    stat_file_path = pathlib.Path(stat_file_filename)
     if not stat_file_path.exists() or stat_file_path.stat().st_size == 0:
         with open(stat_file_filename, 'w') as fd:
             fd.write('\t'.join(['timestamp'] + sorted_subreddits) + '\n')
