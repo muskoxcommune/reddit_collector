@@ -74,7 +74,7 @@ def dump_post_data(data):
     dump_file_filename = args.out_dir + '/selftext/' + data['permalink'].replace('/', '_') + '.json'
     logging.debug('Writing %s', dump_file_filename)
     with open(dump_file_filename, 'w') as fd:
-        json.dump(fd, data)
+        json.dump(data, fd)
 
 def process_post_list(response, process_pool, subreddit_name=None):
     response_data = response.json()
