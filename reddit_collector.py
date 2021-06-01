@@ -1,5 +1,6 @@
 #!/opt/homebrew/bin/python3
 from ratelimit import limits  # https://pypi.org/project/ratelimit
+from datetime import datetime, timezone
 
 import argparse
 import copy
@@ -18,13 +19,14 @@ access_token = None
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument('--id', required=True, help='app client ID')
+argparser.add_argument('--max-age', metavar='SECONDS', type=int, default=3600*24, help='threshold for excluding posts by age')
+argparser.add_argument('--out-dir', metavar='DIRECTORY', default='/tmp/reddit_collector', help='directory for writing output')
 argparser.add_argument('--password', required=True, help='reddit development user password')
 argparser.add_argument('--secret', required=True, help='app client secret')
 argparser.add_argument('--user', required=True, help='reddit development user')
 argparser.add_argument('subreddit', nargs='+', help='subreddit to craw')
 args = argparser.parse_args()
 
-age_cutoff_seconds = 3600 * 24
 stats = {
     'script': {
         'status_codes': {}},
@@ -51,7 +53,7 @@ logging.basicConfig(
 # Fetch new token if token file is not found or token file is older
 # than 59 minutes. Default token expiration is 60 minutes.
 if (not access_token_path.exists()
-        or float(time.time()) - access_token_path.stat().st_mtime > 3540):
+        or datetime.now(timezone.utc).timestamp() - access_token_path.stat().st_mtime > 3540):
     logging.info('Fetching new access token')
     response = requests.post(
         url='https://www.reddit.com/api/v1/access_token',
@@ -74,7 +76,7 @@ else:
         access_token = json.load(fd)['access_token']
 
 logging.info('Using token %s, last modified %d seconds ago',
-    access_token, float(time.time()) - access_token_path.stat().st_mtime)
+    access_token, datetime.now(timezone.utc).timestamp() - access_token_path.stat().st_mtime)
 
 # Reddit requires capping requests at 1 rps.
 # https://github.com/reddit-archive/reddit/wiki/API#rules
@@ -102,8 +104,8 @@ def process_post_list(response, subreddit_name=None):
         logging.debug('Processing %s posts', len(response_data['data']['children']))
         age_seconds = 0
         for post in response_data['data']['children']:
-            age_seconds = float(time.time()) - float(post['data']['created_utc'])
-            if age_seconds >= age_cutoff_seconds:
+            age_seconds = datetime.now(timezone.utc).timestamp() - float(post['data']['created_utc'])
+            if age_seconds >= args.max_age:
                 break
             stats['subreddit'][subreddit_name]['_tmp']['authors'].add(post['data']['author'])
             stats['subreddit'][subreddit_name]['stats']['num_posts'] += 1
@@ -129,7 +131,7 @@ def process_post_list(response, subreddit_name=None):
                     post['data']['num_comments'],
                     post['data']['num_crossposts'],
                     post['data']['title'])
-        return None if age_seconds == 0 or age_seconds > age_cutoff_seconds else response_data['data']['after']
+        return None if age_seconds == 0 or age_seconds > args.max_age else response_data['data']['after']
     except Exception as exc:
         logging.error(traceback.format_exc())
 
@@ -153,11 +155,36 @@ for subreddit_name in args.subreddit:
             after = process_post_list(response, subreddit_name=subreddit_name)
             if after is None:
                 paginate_enabled = False
-    stats['subreddit'][subreddit_name]['stats']['avg_age_seconds'] = (
-        stats['subreddit'][subreddit_name]['_tmp']['sum_age_seconds'] / stats['subreddit'][subreddit_name]['stats']['num_posts'])
+    if stats['subreddit'][subreddit_name]['stats']['num_posts'] > 0:
+        stats['subreddit'][subreddit_name]['stats']['avg_age_seconds'] = (
+            stats['subreddit'][subreddit_name]['_tmp']['sum_age_seconds'] / stats['subreddit'][subreddit_name]['stats']['num_posts'])
+    else:
+        stats['subreddit'][subreddit_name]['stats']['avg_age_seconds'] = 0
     stats['subreddit'][subreddit_name]['stats']['num_authors'] = len(
         stats['subreddit'][subreddit_name]['_tmp']['authors'])
     del stats['subreddit'][subreddit_name]['_tmp']
 
 logging.debug('Script stats:\n%s', pprint.pformat(stats['script']))
 logging.debug('Subreddit stats:\n%s', pprint.pformat(stats['subreddit']))
+
+out_dir_path = pathlib.Path(args.out_dir)
+if not out_dir_path.exists():
+    out_dir_path.mkdir()
+
+sorted_subreddits = sorted(stats['subreddit'].keys())
+for stat_name in subreddit_stats_template.keys():
+    logging.info('Generating TSV for subreddit %s', stat_name)
+    stat_file_filename = args.out_dir + '/subreddit.' + stat_name + '.tsv'
+    stat_file_path = pathlib.Path(stat_file_filename)
+
+    data = []
+    for subreddit_name in sorted_subreddits:
+        data.append(stats['subreddit'][subreddit_name]['stats'][stat_name])
+    serialized_data = '\t'.join([datetime.now(timezone.utc).strftime('%m/%d/%Y %H:%M:%S')] + [str(value) for value in data]) + '\n'
+    if not stat_file_path.exists() or stat_file_path.stat().st_size == 0:
+        with open(stat_file_filename, 'w') as fd:
+            fd.write('\t'.join(['timestamp'] + sorted_subreddits) + '\n')
+            fd.write(serialized_data)
+    else:
+        with open(stat_file_filename, 'a') as fd:
+            fd.write(serialized_data)
