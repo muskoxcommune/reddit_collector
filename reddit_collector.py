@@ -11,7 +11,6 @@ import pathlib
 import platform
 import pprint
 import requests
-import time
 import traceback
 
 access_token_filename = '/tmp/reddit.token.json'
