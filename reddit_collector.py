@@ -1,21 +1,24 @@
 #!/opt/homebrew/bin/python3
+from collections import Counter
 from ratelimit import limits  # https://pypi.org/project/ratelimit
 from datetime import datetime, timezone
 
 import argparse
 import concurrent.futures
 import copy
+import en_core_web_sm
 import json
 import logging
 import pathlib
 import platform
 import pprint
 import requests
+import spacy
 import traceback
 
-access_token_filename = '/tmp/reddit.token.json'
-access_token_path = pathlib.Path(access_token_filename)
-access_token = None
+# TODO:
+# - Include/exclude entities by entity label
+# - Parse comments for posts surpassing threshold of upvotes or comments
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument('--dump-selftext', action='store_true', default=False, help='dump text posts to file')
@@ -29,11 +32,10 @@ argparser.add_argument('--user', required=True, help='reddit development user')
 argparser.add_argument('subreddit', nargs='+', help='subreddit to craw')
 args = argparser.parse_args()
 
-stats = {
-    'script': {
-        'status_codes': {}},
-    'subreddit': {}
-}
+access_token_filename = '/tmp/reddit.token.json'
+access_token_path = pathlib.Path(access_token_filename)
+access_token = None
+nlp = en_core_web_sm.load()
 subreddit_stats_template = {
     'avg_age_seconds': 0,
     'num_posts': 0,
@@ -64,10 +66,6 @@ def do_get(api_url, api_params={}):
             'User-Agent': user_agent,
         })
     logging.debug('%s %s', response, response.headers)
-    if response.status_code in stats['script']['status_codes']:
-        stats['script']['status_codes'][response.status_code] += 1
-    else:
-        stats['script']['status_codes'][response.status_code] = 1
     return response
 
 def dump_post_data(data):
@@ -76,7 +74,13 @@ def dump_post_data(data):
     with open(dump_file_filename, 'w') as fd:
         json.dump(data, fd)
 
-def process_post_list(response, process_pool, subreddit_name=None):
+def extract_common_text_entities(blob):
+    text = nlp(blob)
+    #return [(X.text, X.label_) for X in (text.ents)]
+    return [(X.text, X.label_) for X in (text.ents)
+        if X.label_ == 'ORG']
+
+def process_post_list(response, process_pool, stats, subreddit_name=None):
     response_data = response.json()
     try:
         assert response_data['data']
@@ -87,6 +91,7 @@ def process_post_list(response, process_pool, subreddit_name=None):
             age_seconds = datetime.now(timezone.utc).timestamp() - float(post['data']['created_utc'])
             if age_seconds >= args.max_age:
                 break
+            future_entities = process_pool.submit(extract_common_text_entities, post['data']['title'] + ' ' + post['data']['selftext'])
             stats['subreddit'][subreddit_name]['_tmp']['authors'].add(post['data']['author'])
             stats['subreddit'][subreddit_name]['stats']['num_posts'] += 1
             stats['subreddit'][subreddit_name]['stats']['num_comments'] += int(post['data']['num_comments'])
@@ -113,7 +118,9 @@ def process_post_list(response, process_pool, subreddit_name=None):
                 stats['subreddit'][subreddit_name]['stats']['num_selftexts'] += 1
                 if args.dump_selftext:
                     process_pool.submit(dump_post_data, post['data'])
-        return None if age_seconds == 0 or age_seconds > args.max_age else response_data['data']['after']
+            stats['subreddit'][subreddit_name]['_tmp']['entities'] += future_entities.result()
+        # Check age of last article
+        return stats, None if age_seconds == 0 or age_seconds > args.max_age else response_data['data']['after']
     except Exception as exc:
         logging.error(traceback.format_exc())
 
@@ -157,10 +164,16 @@ if __name__ == '__main__':
 
     process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=args.workers)
 
+    stats = {
+        'script': {
+            'status_codes': {}},
+        'subreddit': {}
+    }
     for subreddit_name in args.subreddit:
         stats['subreddit'][subreddit_name] = {
             '_tmp': {
                 'authors': set(),
+                'entities': [],
                 'sum_age_seconds': 0
             },
             'stats': copy.deepcopy(subreddit_stats_template)
@@ -173,10 +186,15 @@ if __name__ == '__main__':
             if after is not None:
                 api_params['after'] = after
             response = do_get(api_url, api_params=api_params)
+            if response.status_code in stats['script']['status_codes']:
+                stats['script']['status_codes'][response.status_code] += 1
+            else:
+                stats['script']['status_codes'][response.status_code] = 1
             if response.status_code == 200:
-                after = process_post_list(response, process_pool, subreddit_name=subreddit_name)
+                stats, after = process_post_list(response, process_pool, stats, subreddit_name=subreddit_name)
                 if after is None:
                     paginate_enabled = False
+
         if stats['subreddit'][subreddit_name]['stats']['num_posts'] > 0:
             stats['subreddit'][subreddit_name]['stats']['avg_age_seconds'] = (
                 stats['subreddit'][subreddit_name]['_tmp']['sum_age_seconds'] / stats['subreddit'][subreddit_name]['stats']['num_posts'])
@@ -184,6 +202,8 @@ if __name__ == '__main__':
             stats['subreddit'][subreddit_name]['stats']['avg_age_seconds'] = 0
         stats['subreddit'][subreddit_name]['stats']['num_authors'] = len(
             stats['subreddit'][subreddit_name]['_tmp']['authors'])
+        stats['subreddit'][subreddit_name]['stats']['top_entities'] = Counter(
+            stats['subreddit'][subreddit_name]['_tmp']['entities']).most_common()[:10]
         del stats['subreddit'][subreddit_name]['_tmp']
 
     logging.debug('Script stats:\n%s', pprint.pformat(stats['script']))

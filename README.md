@@ -2,7 +2,7 @@
 
 Given a list of subreddits, craws them and records post stats.
 
-## Available stats
+## Basic stats
 - avg_age_seconds
 - num_posts
 - num_comments
@@ -45,4 +45,10 @@ optional arguments:
   --password PASSWORD  reddit development user password
   --secret SECRET      app client secret
   --user USER          reddit development user
+```
+
+## Install spaCy
+```
+pip3 install spacy
+python3 -m spacy download en_core_web_sm
 ```
