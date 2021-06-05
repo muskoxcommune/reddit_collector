@@ -21,11 +21,10 @@ import traceback
 # - Include/exclude entities by entity label
 # - Reject entities not in allow list
 # - Paginate more comments
-# - Finish dumping comments
 
 argparser = argparse.ArgumentParser()
-argparser.add_argument('--dump-comment', action='store_true', default=False, help='dump comments to file')
-argparser.add_argument('--dump-selftext', action='store_true', default=False, help='dump text posts to file')
+argparser.add_argument('--dump-comments', action='store_true', default=False, help='dump comments to file')
+argparser.add_argument('--dump-selftexts', action='store_true', default=False, help='dump text posts to file')
 argparser.add_argument('--id', required=True, help='app client ID')
 argparser.add_argument('--workers', metavar='NUM', type=int, default=8, help='number of workers (not used for making requests)')
 argparser.add_argument('--max-age', metavar='SECONDS', type=int, default=3600*24, help='threshold for excluding posts by age')
@@ -39,6 +38,7 @@ args = argparser.parse_args()
 access_token_filename = '/tmp/reddit.token.json'
 access_token_path = pathlib.Path(access_token_filename)
 access_token = None
+date_blob = datetime.now(timezone.utc).strftime('%Y%m%d')
 log_filename = args.out_dir + '/reddit_collector.log'
 nlp = en_core_web_sm.load()
 oauth_endpoint = 'https://oauth.reddit.com'
@@ -104,8 +104,8 @@ def do_get(api_url, api_params={}):
         })
     return response
 
-def dump_post_data(data):
-    dump_file_filename = args.out_dir + '/selftext/' + data['permalink'].replace('/', '_') + '.json'
+def dump_data(data, data_dir):
+    dump_file_filename = args.out_dir + '/' + data_dir + '/' + date_blob + '/' + data['permalink'].replace('/', '_') + '.json'
     logging.debug('Writing %s', dump_file_filename)
     with open(dump_file_filename, 'w') as fd:
         json.dump(data, fd)
@@ -128,6 +128,8 @@ def process_comments(comment_list, executor, stats):
             stats['subreddit'][subreddit_name]['stats']['num_comment_awards'] += int(comment['data']['total_awards_received'])
             if type(comment['data']['replies']) == list:
                 comment_entities += process_comments(comment['data']['replies'], executor, stats)
+            if args.dump_comments:
+                executor.submit(dump_data, comment['data'], 'comments')
     for future in entity_futures:
         comment_entities += future.result()
     return comment_entities
@@ -174,8 +176,8 @@ def process_post_list(subreddit_name, payload, executor, stats):
             stats['subreddit'][subreddit_name]['stats']['num_urls'] += 1
         else:
             stats['subreddit'][subreddit_name]['stats']['num_selftexts'] += 1
-            if args.dump_selftext:
-                executor.submit(dump_post_data, post['data'])
+            if args.dump_selftexts:
+                executor.submit(dump_data, post['data'], 'selftexts')
         stats['subreddit'][subreddit_name]['_tmp']['post_entities'] += future_post_entities.result()
     # Check age of last article
     return stats, None if age_seconds == 0 or age_seconds > args.max_age else payload['data']['after']
@@ -197,14 +199,14 @@ if __name__ == '__main__':
     out_dir_path = pathlib.Path(args.out_dir)
     if not out_dir_path.exists():
         out_dir_path.mkdir()
-    if args.dump_selftext:
-        selftext_path = pathlib.Path(args.out_dir + '/comments')
+    if args.dump_comments:
+        selftext_path = pathlib.Path(args.out_dir + '/comments/' + date_blob)
         if not selftext_path.exists():
-            selftext_path.mkdir()
-    if args.dump_selftext:
-        selftext_path = pathlib.Path(args.out_dir + '/selftext')
+            selftext_path.mkdir(parents=True)
+    if args.dump_selftexts:
+        selftext_path = pathlib.Path(args.out_dir + '/selftexts/' + date_blob)
         if not selftext_path.exists():
-            selftext_path.mkdir()
+            selftext_path.mkdir(parents=True)
 
     # Process subreddits
     abort_run = False
