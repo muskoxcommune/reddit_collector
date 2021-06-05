@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import argparse
 import concurrent.futures
 import copy
-import en_core_web_sm
+import en_core_web_lg
 import json
 import logging
 import pathlib
@@ -18,20 +18,22 @@ import time
 import traceback
 
 # TODO:
-# - Include/exclude entities by entity label
 # - Reject entities not in allow list
 # - Paginate more comments
 
 argparser = argparse.ArgumentParser()
+
 argparser.add_argument('--dump-comments', action='store_true', default=False, help='dump comments to file')
 argparser.add_argument('--dump-selftexts', action='store_true', default=False, help='dump text posts to file')
+argparser.add_argument('--exc-label', metavar='LABEL', action='append', help='exclude specified entity types')
 argparser.add_argument('--id', required=True, help='app client ID')
-argparser.add_argument('--workers', metavar='NUM', type=int, default=8, help='number of workers (not used for making requests)')
+argparser.add_argument('--inc-label', metavar='LABEL', action='append', help='include only specified entity types')
 argparser.add_argument('--max-age', metavar='SECONDS', type=int, default=3600*24, help='threshold for excluding posts by age')
 argparser.add_argument('--out-dir', metavar='DIRECTORY', default='/tmp/reddit_collector', help='directory for writing output')
 argparser.add_argument('--password', required=True, help='reddit development user password')
 argparser.add_argument('--secret', required=True, help='app client secret')
 argparser.add_argument('--user', required=True, help='reddit development user')
+argparser.add_argument('--workers', metavar='NUM', type=int, default=8, help='number of workers (not used for making requests)')
 argparser.add_argument('subreddit', nargs='+', help='subreddit to craw')
 args = argparser.parse_args()
 
@@ -40,7 +42,7 @@ access_token_path = pathlib.Path(access_token_filename)
 access_token = None
 date_blob = datetime.now(timezone.utc).strftime('%Y%m%d')
 log_filename = args.out_dir + '/reddit_collector.log'
-nlp = en_core_web_sm.load()
+nlp = en_core_web_lg.load()
 oauth_endpoint = 'https://oauth.reddit.com'
 subreddit_stats_template = {
     'avg_age_seconds': 0,
@@ -112,9 +114,20 @@ def dump_data(data, data_dir):
 
 def extract_text_entities(blob):
     text = nlp(blob)
-    #return [(X.text, X.label_) for X in (text.ents)]
-    return [(X.text, X.label_) for X in (text.ents)
-        if X.label_ == 'ORG']
+    logging.debug('Text entities: %s, text: %s', text.ents, blob)
+    filtered_entities = []
+    # See NER: https://spacy.io/models/en#en_core_web_lg-labels
+    if args.inc_label:
+        for ent in text.ents:
+            if ent.label_ in args.inc_label:
+                filtered_entities.append((ent.text, ent.label_))
+    elif args.exc_label:
+        for ent in text.ents:
+            if ent.label_ not in args.exc_label:
+                filtered_entities.append((ent.text, ent.label_))
+    else:
+        filtered_entities = [(ent.text, ent.label_) for ent in text.ents]
+    return filtered_entities
 
 def process_comments(comment_list, executor, stats):
     comment_entities = []
