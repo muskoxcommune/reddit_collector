@@ -42,19 +42,18 @@ subreddit_stats_template = {
     'avg_age_seconds': 0,
     'num_awards': 0,
     'num_comment_awards': 0,
+    'num_comment_downs': 0,
     'num_comment_polarity_eq_0': 0,
     'num_comment_polarity_gt_0': 0,
     'num_comment_polarity_lt_0': 0,
     'num_comment_ups': 0,
     'num_comments': 0,
     'num_crossposts': 0,
+    'num_downs': 0,
     'num_polarity_eq_0': 0,
     'num_polarity_gt_0': 0,
     'num_polarity_lt_0': 0,
     'num_posts': 0,
-    'num_score_eq_0': 0,
-    'num_score_gt_0': 0,
-    'num_score_lt_0': 0,
     'num_selftexts': 0,
     'num_ups': 0,
     'num_urls': 0,
@@ -120,6 +119,7 @@ def process_comments(subreddit_name, comment_list, nlp, executor, stats):
         else:
             entity_futures.append(executor.submit(extract_text_entities, nlp, comment['data']['body']))
             stats['subreddit'][subreddit_name]['stats']['num_comment_awards'] += int(comment['data']['total_awards_received'])
+            stats['subreddit'][subreddit_name]['stats']['num_comment_downs'] += int(comment['data']['downs'])
             stats['subreddit'][subreddit_name]['stats']['num_comment_ups'] += int(comment['data']['ups'])
             if type(comment['data']['replies']) == list:
                 stats = process_comments(subreddit_name, comment['data']['replies'], nlp, executor, stats)
@@ -171,6 +171,7 @@ def process_post_list(subreddit_name, payload, access_token, nlp, executor, stat
         stats['subreddit'][subreddit_name]['stats']['num_awards'] += int(post['data']['total_awards_received'])
         stats['subreddit'][subreddit_name]['stats']['num_comments'] += int(post['data']['num_comments'])
         stats['subreddit'][subreddit_name]['stats']['num_crossposts'] += int(post['data']['num_crossposts'])
+        stats['subreddit'][subreddit_name]['stats']['num_downs'] += int(post['data']['downs'])
         stats['subreddit'][subreddit_name]['stats']['num_posts'] += 1
         stats['subreddit'][subreddit_name]['stats']['num_ups'] += int(post['data']['ups'])
 
@@ -180,13 +181,6 @@ def process_post_list(subreddit_name, payload, access_token, nlp, executor, stat
             stats['subreddit'][subreddit_name]['stats']['num_selftexts'] += 1
             if args.dump_selftexts:
                 executor.submit(dump_data, post['data'], 'selftexts')
-
-        if post['data']['score'] == 0:
-            stats['subreddit'][subreddit_name]['stats']['num_score_eq_0'] += 1
-        elif post['data']['score'] > 0:
-            stats['subreddit'][subreddit_name]['stats']['num_score_gt_0'] += 1
-        else:
-            stats['subreddit'][subreddit_name]['stats']['num_score_lt_0'] += 1
 
         entities, sentiment_polarity = entity_future.result()
         stats['subreddit'][subreddit_name]['_tmp']['post_entities'] += entities
