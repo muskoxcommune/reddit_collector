@@ -93,31 +93,13 @@ def dump_data(data, data_dir):
     with open(dump_file_filename, 'w') as fd:
         json.dump(data, fd)
 
-def extract_text_entities(nlp, blob):
-    text = nlp(blob)
-    filtered_entities = []
-    # See NER: https://spacy.io/models/en#en_core_web_sm-labels
-    if args.inc_label:
-        for ent in text.ents:
-            if ent.label_ in args.inc_label:
-                filtered_entities.append((ent.text, ent.label_))
-    elif args.exc_label:
-        for ent in text.ents:
-            if ent.label_ not in args.exc_label:
-                filtered_entities.append((ent.text, ent.label_))
-    else:
-        filtered_entities = [(ent.text, ent.label_) for ent in text.ents]
-    sentiment = TextBlob(blob).sentiment
-    logging.debug('Sentiment: %s, entities: %s, text: %s', sentiment, text.ents, blob)
-    return filtered_entities, sentiment.polarity
-
 def process_comments(subreddit_name, comment_list, nlp, executor, stats):
     entity_futures = []
     for comment in comment_list:
         if 'body' not in comment['data']:
             logging.debug('Not a comment: %s', comment['data'])
         else:
-            entity_futures.append(executor.submit(extract_text_entities, nlp, comment['data']['body']))
+            entity_futures.append(executor.submit(process_text_blob, nlp, comment['data']['body']))
             stats['subreddit'][subreddit_name]['stats']['num_comment_awards'] += int(comment['data']['total_awards_received'])
             stats['subreddit'][subreddit_name]['stats']['num_comment_downs'] += int(comment['data']['downs'])
             stats['subreddit'][subreddit_name]['stats']['num_comment_ups'] += int(comment['data']['ups'])
@@ -163,7 +145,7 @@ def process_post_list(subreddit_name, payload, access_token, nlp, executor, stat
         if age_seconds >= args.max_age:
             break
         # Glob title and text body together for entity extraction.
-        entity_future = executor.submit(extract_text_entities, nlp, post['data']['title'] + ' ' + post['data']['selftext'])
+        entity_future = executor.submit(process_text_blob, nlp, post['data']['title'] + ' ' + post['data']['selftext'])
         if post['data']['num_comments'] > 1:
             stats = process_comment_list(subreddit_name, post, access_token, nlp, executor, stats)
         stats['subreddit'][subreddit_name]['_tmp']['authors'].add(post['data']['author'])
@@ -203,6 +185,24 @@ def process_response(response, stats):
     else:
         logging.error('%s %s %s', response, response.headers, response.content)
         return None, stats
+
+def process_text_blob(nlp, blob):
+    text = nlp(blob)
+    filtered_entities = []
+    # See NER: https://spacy.io/models/en#en_core_web_sm-labels
+    if args.inc_label:
+        for ent in text.ents:
+            if ent.label_ in args.inc_label:
+                filtered_entities.append((ent.text, ent.label_))
+    elif args.exc_label:
+        for ent in text.ents:
+            if ent.label_ not in args.exc_label:
+                filtered_entities.append((ent.text, ent.label_))
+    else:
+        filtered_entities = [(ent.text, ent.label_) for ent in text.ents]
+    sentiment = TextBlob(blob).sentiment
+    logging.debug('%s, entities: %s, text: %s', sentiment, text.ents, blob)
+    return filtered_entities, sentiment.polarity
 
 if __name__ == '__main__':
 
