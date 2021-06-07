@@ -214,7 +214,7 @@ if __name__ == '__main__':
     if (not access_token_path.exists()
             or datetime.now(timezone.utc).timestamp() - access_token_path.stat().st_mtime > 3540):
         access_token_failures = 0
-        while access_token == None:
+        while access_token is None:
             response = requests.post(
                 url=(www_endpoint + '/api/v1/access_token'),
                 auth=requests.auth.HTTPBasicAuth(args.id, args.secret),
@@ -254,7 +254,6 @@ if __name__ == '__main__':
             selftext_path.mkdir(parents=True)
 
     nlp = spacy.load('en_core_web_sm')
-    #nlp.add_pipe("spacytextblob")
     logging.debug("Pipeline: %s", nlp.pipe_names)
 
     # Process subreddits

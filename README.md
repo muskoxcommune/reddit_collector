@@ -49,8 +49,7 @@ optional arguments:
 
 ## Install spaCy
 ```
-pip3 install spacy
-pip3 install spacytextblob
+pip3 install spacy spacy-lookups-data textblob
 # See: https://spacy.io/models/en
 python3 -m spacy download en_core_web_sm
 python3 -m textblob.download_corpora
