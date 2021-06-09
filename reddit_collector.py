@@ -23,14 +23,16 @@ import traceback
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument('--dump-comments', action='store_true', default=False, help='dump comments to file')
-argparser.add_argument('--dump-selftexts', action='store_true', default=False, help='dump text posts to file')
-argparser.add_argument('--exc-label', metavar='LABEL', action='append', help='exclude specified entity types')
+argparser.add_argument('--dump-texts', action='store_true', default=False, help='dump text posts to file')
+argparser.add_argument('--exclude-entity-label', metavar='LABEL', action='append', help='exclude specified entity types')
 argparser.add_argument('--id', required=True, help='app client ID')
-argparser.add_argument('--inc-label', metavar='LABEL', action='append', help='include only specified entity types')
+argparser.add_argument('--include-entity-label', metavar='LABEL', action='append', help='include only specified entity types')
 argparser.add_argument('--max-age', metavar='SECONDS', type=int, default=3600*24, help='threshold for excluding posts by age')
 argparser.add_argument('--out-dir', metavar='DIRECTORY', default='/tmp/reddit_collector', help='directory for writing output')
 argparser.add_argument('--password', required=True, help='reddit development user password')
 argparser.add_argument('--secret', required=True, help='app client secret')
+argparser.add_argument('--skip-comment-entities', action='store_true', default=False, help='skip entity analysis on comments')
+argparser.add_argument('--skip-text-entities', action='store_true', default=False, help='skip entity analysis on text posts')
 argparser.add_argument('--user', required=True, help='reddit development user')
 argparser.add_argument('-v', '--verbose', action='store_true', default=False, help='verbose logging')
 argparser.add_argument('--workers', metavar='NUM', type=int, default=8, help='number of workers (not used for making requests)')
@@ -40,7 +42,9 @@ args = argparser.parse_args()
 date_blob = datetime.now(timezone.utc).strftime('%Y%m%d')
 
 subreddit_stats_template = {
+    'negative_polarity_ratio': 0,
     'num_awards': 0,
+    'num_comment_candidates': 0,
     'num_comments': 0,
     'num_interactions': 0,
     'num_polarity_eq_0': 0,
@@ -50,6 +54,7 @@ subreddit_stats_template = {
     'num_selftexts': 0,
     'num_ups': 0,
     'num_urls': 0,
+    'positive_polarity_ratio': 0,
 }
 
 oauth_endpoint = 'https://oauth.reddit.com'
@@ -87,6 +92,25 @@ def dump_data(data, data_dir):
     with open(dump_file_filename, 'w') as fd:
         json.dump(data, fd)
 
+def extract_named_entities(nlp, blob):
+    text = nlp(blob)
+    filtered_entities = []
+    # See NER: https://spacy.io/models/en#en_core_web_sm-labels
+    if args.include_entity_label:
+        for ent in text.ents:
+            if ent.label_ in args.include_entity_label:
+                filtered_entities.append((ent.text, ent.label_))
+    elif args.exclude_entity_label:
+        for ent in text.ents:
+            if ent.label_ not in args.exclude_entity_label:
+                filtered_entities.append((ent.text, ent.label_))
+    else:
+        filtered_entities = [(ent.text, ent.label_) for ent in text.ents]
+    sentiment = TextBlob(blob).sentiment
+    if args.verbose:
+        logging.debug('%s, entities: %s, text: %s', sentiment, text.ents, blob)
+    return filtered_entities, sentiment.polarity
+
 def finalize_future(subreddit_name, future, stats):
     entities, sentiment_polarity = future.result()
     stats['subreddit'][subreddit_name]['_tmp']['entities'] += entities
@@ -98,13 +122,14 @@ def finalize_future(subreddit_name, future, stats):
         stats['subreddit'][subreddit_name]['stats']['num_polarity_lt_0'] += 1
     return stats
 
-def paginate_and_process(url, access_token, futures, hook, executors, nlp, stats, subreddit_name):
+def paginate_and_process(url, access_token, futures, hook, executors, nlp, stats, subreddit_name,
+                         api_params_template={'limit': 100, 'show': 'all'}):
     abort = False
     after = None
     failures = 0
     paginate_enabled = True
     while paginate_enabled is True:
-        api_params={'limit': 100, 'show': 'all'}
+        api_params = copy.deepcopy(api_params_template)
         if after is not None:
             api_params['after'] = after
         try:
@@ -112,8 +137,6 @@ def paginate_and_process(url, access_token, futures, hook, executors, nlp, stats
             response, stats = process_response(response, stats)
             if response is not None:
                 payload = response.json()
-                assert payload['data']
-                assert payload['data']['children']
                 futures, stats, after = hook(payload, futures, executor, nlp, stats, subreddit_name)
                 if after is None:
                     paginate_enabled = False
@@ -123,31 +146,39 @@ def paginate_and_process(url, access_token, futures, hook, executors, nlp, stats
                 abort = True
                 break
         except ratelimit.exception.RateLimitException as exc:
-            #if futures[subreddit_name]:
-            #    stats = finalize_future(subreddit_name, futures[subreddit_name].pop(0), stats)
-            #else:
-            #    time.sleep(0.1)
             time.sleep(0.1)
         except Exception as exc:
             logging.error(traceback.format_exc())
             failures += 1
     return futures, stats, abort
 
-def process_comment_list(payload, futures, executor, nlp, stats, subreddit_name):
+def process_article(payload, futures, executor, nlp, stats, subreddit_name):
+    #post_list = payload[0]
+    comment_list = payload[1]
+    return process_comment_list(comment_list, futures, executor, nlp, stats, subreddit_name, skip_age_check=True)
+
+def process_comment_list(payload, futures, executor, nlp, stats, subreddit_name, skip_age_check=False):
     logging.debug('Processing %s comments', len(payload['data']['children']))
     age_seconds = 0
     for comment in payload['data']['children']:
+        if comment['kind'] == 'more':
+            stats['subreddit'][subreddit_name]['_tmp']['more_comments'].append(comment['data'])
+            continue
         age_seconds = datetime.now(timezone.utc).timestamp() - float(comment['data']['created_utc'])
-        if age_seconds >= args.max_age:
-            break
+        if skip_age_check is False and age_seconds >= args.max_age:
+            continue
         logging.debug('Processing comment, age: %d, length: %d', age_seconds, len(comment['data']['body']))
-        futures[subreddit_name].append(executor.submit(process_text_blob, nlp, comment['data']['body']))
+        if args.skip_comment_entities is False:
+            futures[subreddit_name].append(executor.submit(extract_named_entities, nlp, comment['data']['body']))
+        if comment['data']['replies']:
+            process_comment_list(comment['data']['replies'], futures, executor, nlp, stats, subreddit_name, skip_age_check=True)
         stats['subreddit'][subreddit_name]['stats']['num_awards'] += int(comment['data']['total_awards_received'])
         stats['subreddit'][subreddit_name]['stats']['num_interactions'] += 1
         stats['subreddit'][subreddit_name]['stats']['num_ups'] += int(comment['data']['ups'])
         if args.dump_comments:
             executor.submit(dump_data, comment['data'], 'comments')
     if age_seconds == 0 or age_seconds > args.max_age:
+        logging.debug('Found comment created %s seconds ago. Disabling pagination.', age_seconds)
         return futures, stats, None
     else:
         return futures, stats, payload['data']['after']
@@ -160,10 +191,9 @@ def process_post_list(payload, futures, executor, nlp, stats, subreddit_name):
         if age_seconds >= args.max_age:
             break
         logging.debug('Processing post, age: %d, length: %d', age_seconds, len(post['data']['title']))
-        # Glob title and text body together for entity extraction.
-        futures[subreddit_name].append(executor.submit(process_text_blob, nlp, post['data']['title'] + '. ' + post['data']['selftext']))
-        stats['subreddit'][subreddit_name]['_tmp']['authors'].add(post['data']['author'])
-        stats['subreddit'][subreddit_name]['_tmp']['sum_age_seconds'] += age_seconds
+        if args.skip_text_entities is False:
+            # Glob title and text body together for entity extraction.
+            futures[subreddit_name].append(executor.submit(extract_named_entities, nlp, post['data']['title'] + '. ' + post['data']['selftext']))
         stats['subreddit'][subreddit_name]['stats']['num_awards'] += int(post['data']['total_awards_received'])
         stats['subreddit'][subreddit_name]['stats']['num_comments'] += int(post['data']['num_comments'])
         stats['subreddit'][subreddit_name]['stats']['num_interactions'] += 1
@@ -173,9 +203,12 @@ def process_post_list(payload, futures, executor, nlp, stats, subreddit_name):
             stats['subreddit'][subreddit_name]['stats']['num_urls'] += 1
         else:
             stats['subreddit'][subreddit_name]['stats']['num_selftexts'] += 1
-            if args.dump_selftexts:
+            if args.dump_texts:
                 executor.submit(dump_data, post['data'], 'selftexts')
+        if int(post['data']['ups']) > 100 and int(post['data']['num_comments']) > 0:
+            stats['subreddit'][subreddit_name]['_tmp']['comment_candidates'].append(post['data']['permalink'])
     if age_seconds == 0 or age_seconds > args.max_age:
+        logging.debug('Found post created %s seconds ago. Disabling pagination.', age_seconds)
         return futures, stats, None
     else:
         return futures, stats, payload['data']['after']
@@ -190,25 +223,6 @@ def process_response(response, stats):
     else:
         logging.error('%s %s %s', response, response.headers, response.content)
         return None, stats
-
-def process_text_blob(nlp, blob):
-    text = nlp(blob)
-    filtered_entities = []
-    # See NER: https://spacy.io/models/en#en_core_web_sm-labels
-    if args.inc_label:
-        for ent in text.ents:
-            if ent.label_ in args.inc_label:
-                filtered_entities.append((ent.text, ent.label_))
-    elif args.exc_label:
-        for ent in text.ents:
-            if ent.label_ not in args.exc_label:
-                filtered_entities.append((ent.text, ent.label_))
-    else:
-        filtered_entities = [(ent.text, ent.label_) for ent in text.ents]
-    sentiment = TextBlob(blob).sentiment
-    if args.verbose:
-        logging.debug('%s, entities: %s, text: %s', sentiment, text.ents, blob)
-    return filtered_entities, sentiment.polarity
 
 if __name__ == '__main__':
 
@@ -254,7 +268,7 @@ if __name__ == '__main__':
         selftext_path = pathlib.Path(args.out_dir + '/comments/' + date_blob)
         if not selftext_path.exists():
             selftext_path.mkdir(parents=True)
-    if args.dump_selftexts:
+    if args.dump_texts:
         selftext_path = pathlib.Path(args.out_dir + '/selftexts/' + date_blob)
         if not selftext_path.exists():
             selftext_path.mkdir(parents=True)
@@ -275,18 +289,26 @@ if __name__ == '__main__':
         futures[subreddit_name] = []
         stats['subreddit'][subreddit_name] = {
             '_tmp': {
-                'authors': set(),
+                'comment_candidates': [],
                 'entities': [],
-                'sum_age_seconds': 0
+                'more_comments': [],
             },
             'stats': copy.deepcopy(subreddit_stats_template)
         }
         futures, stats, abort = paginate_and_process(
             oauth_endpoint + '/r/' + subreddit_name + '/new', access_token,
             futures, process_post_list, executor, nlp, stats, subreddit_name)
-        futures, stats, abort = paginate_and_process(
-            oauth_endpoint + '/r/' + subreddit_name + '/comments', access_token,
-            futures, process_comment_list, executor, nlp, stats, subreddit_name)
+        if abort is True:
+            break
+        # Currently, /r/[subreddit]/comments doesn't return enough comments.
+        #futures, stats, abort = paginate_and_process(
+        #    oauth_endpoint + '/r/' + subreddit_name + '/comments', access_token,
+        #    futures, process_comment_list, executor, nlp, stats, subreddit_name)
+        while abort is False and stats['subreddit'][subreddit_name]['_tmp']['comment_candidates']:
+            futures, stats, abort = paginate_and_process(
+                oauth_endpoint + stats['subreddit'][subreddit_name]['_tmp']['comment_candidates'].pop(0), access_token,
+                futures, process_article, executor, nlp, stats, subreddit_name,
+                api_params_template={'depth': 100, 'limit': 100, 'showmore': 1, 'sort': 'confidence', 'threaded': 1})
         if abort is True:
             break
     if abort is True:
@@ -296,11 +318,16 @@ if __name__ == '__main__':
             logging.debug('Finalizing %s %s futures', len(futures[subreddit_name]), subreddit_name)
             while futures[subreddit_name]:
                 stats = finalize_future(subreddit_name, futures[subreddit_name].pop(0), stats)
+
+            stats['subreddit'][subreddit_name]['stats']['num_comment_candidates'] = len(
+                stats['subreddit'][subreddit_name]['_tmp']['comment_candidates'])
+
             if stats['subreddit'][subreddit_name]['stats']['num_interactions'] > 0:
                 stats['subreddit'][subreddit_name]['stats']['negative_polarity_ratio'] = (
                     stats['subreddit'][subreddit_name]['stats']['num_polarity_lt_0'] / stats['subreddit'][subreddit_name]['stats']['num_interactions'])
                 stats['subreddit'][subreddit_name]['stats']['positive_polarity_ratio'] = (
                     stats['subreddit'][subreddit_name]['stats']['num_polarity_gt_0'] / stats['subreddit'][subreddit_name]['stats']['num_interactions'])
+
             stats['subreddit'][subreddit_name]['stats']['top_entities'] = Counter(
                 stats['subreddit'][subreddit_name]['_tmp']['entities']).most_common()[:50]
             del stats['subreddit'][subreddit_name]['_tmp']
