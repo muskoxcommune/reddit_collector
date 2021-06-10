@@ -4,16 +4,18 @@ from datetime import datetime, timezone
 from textblob import TextBlob
 
 import argparse
-import concurrent.futures
 import copy
 import json
 import logging
+import multiprocessing
 import pathlib
 import platform
 import pprint
 import ratelimit # https://pypi.org/project/ratelimit
+import re
 import requests
 import spacy
+import threading
 import time
 import traceback
 
@@ -31,9 +33,8 @@ argparser.add_argument('--max-age', metavar='SECONDS', type=int, default=3600*24
 argparser.add_argument('--out-dir', metavar='DIRECTORY', default='/tmp/reddit_collector', help='directory for writing output')
 argparser.add_argument('--password', required=True, help='reddit development user password')
 argparser.add_argument('--secret', required=True, help='app client secret')
-argparser.add_argument('--skip-comment-entities', action='store_true', default=False, help='skip entity analysis on comments')
-argparser.add_argument('--skip-text-entities', action='store_true', default=False, help='skip entity analysis on text posts')
-argparser.add_argument('-s', '--str-stats', metavar='STRING', action='append', help='string to get stats for')
+argparser.add_argument('--skip-entities', action='store_true', default=False, help='skip entity analysis')
+argparser.add_argument('-w', '--word-stats', metavar='WORD', action='append', help='worg to get stats for')
 argparser.add_argument('--user', required=True, help='reddit development user')
 argparser.add_argument('-v', '--verbose', action='store_true', default=False, help='verbose logging')
 argparser.add_argument('--workers', metavar='NUM', type=int, default=8, help='number of workers')
@@ -93,18 +94,44 @@ def dump_data(data, data_dir):
     with open(dump_file_filename, 'w') as fd:
         json.dump(data, fd)
 
-def finalize_future(subreddit_name, future, stats):
-    blob, entities, sentiment_polarity = future.result()
+def finalize_delegate_result(subreddit_name, delegator_queue, stats):
+    word_stats, entities, sentiment_polarity = delegator_queue.get()
+    # Entities
     stats['subreddit'][subreddit_name]['_tmp']['entities'] += entities
-    if sentiment_polarity == 0:
+    if sentiment_polarity is None:
+        pass # entity analysis is disabled
+    elif sentiment_polarity == 0:
         stats['subreddit'][subreddit_name]['stats']['num_polarity_eq_0'] += 1
     elif sentiment_polarity > 0:
         stats['subreddit'][subreddit_name]['stats']['num_polarity_gt_0'] += 1
     else:
         stats['subreddit'][subreddit_name]['stats']['num_polarity_lt_0'] += 1
+    # Word stats
+    for match, count in word_stats.items():
+        if match in stats['subreddit'][subreddit_name]['stats']['word']:
+            stats['subreddit'][subreddit_name]['stats']['word'][match] += count
+        else:
+            stats['subreddit'][subreddit_name]['stats']['word'][match] = count
     return stats
 
-def paginate_and_process(url, access_token, futures, hook, executors, nlp, stats, subreddit_name,
+def join_delegates(delegator, stats, subreddit_name, block=False):
+    num_joined = 0
+    num_finalized = 0
+    while delegator['delegates']:
+        delegate = delegator['delegates'].pop(0)
+        if delegate.is_alive() and block is False:
+            break
+        else:
+            delegate.join()
+            num_joined += 1
+    logging.debug('Joined %d delegates', num_joined)
+    while not delegator['queue'].empty():
+        stats = finalize_delegate_result(subreddit_name, delegator['queue'], stats)
+        num_finalized += 1
+    logging.debug('Finalized %d results', num_finalized)
+    return delegator, stats
+
+def paginate_and_process(url, access_token, hook, delegator, nlp, stats, subreddit_name,
                          api_params_template={'limit': 100, 'show': 'all'}):
     abort = False
     after = None
@@ -119,7 +146,7 @@ def paginate_and_process(url, access_token, futures, hook, executors, nlp, stats
             response, stats = process_response(response, stats)
             if response is not None:
                 payload = response.json()
-                futures, stats, after = hook(payload, futures, executor, nlp, stats, subreddit_name)
+                delegator, stats, after = hook(payload, delegator, nlp, stats, subreddit_name)
                 if after is None:
                     paginate_enabled = False
             elif failures <= 3:
@@ -128,18 +155,22 @@ def paginate_and_process(url, access_token, futures, hook, executors, nlp, stats
                 abort = True
                 break
         except ratelimit.exception.RateLimitException as exc:
-            time.sleep(0.1)
+            if delegator['delegates']:
+                # In between API calls, join finished delegates and clear out the queue.
+                delegator, stats = join_delegates(delegator, stats, subreddit_name)
+            else:
+                time.sleep(0.1)
         except Exception as exc:
             logging.error(traceback.format_exc())
             failures += 1
-    return futures, stats, abort
+    return delegator, stats, abort
 
-def process_article(payload, futures, executor, nlp, stats, subreddit_name):
+def process_article(payload, delegator, nlp, stats, subreddit_name):
     #post_list = payload[0]
     comment_list = payload[1]
-    return process_comment_list(comment_list, futures, executor, nlp, stats, subreddit_name, skip_age_check=True)
+    return process_comment_list(comment_list, delegator, nlp, stats, subreddit_name, skip_age_check=True)
 
-def process_comment_list(payload, futures, executor, nlp, stats, subreddit_name, skip_age_check=False):
+def process_comment_list(payload, delegator, nlp, stats, subreddit_name, skip_age_check=False):
     logging.debug('Processing %s comments', len(payload['data']['children']))
     age_seconds = None
     for comment in payload['data']['children']:
@@ -150,24 +181,30 @@ def process_comment_list(payload, futures, executor, nlp, stats, subreddit_name,
         if skip_age_check is False and age_seconds >= args.max_age:
             continue
         logging.debug('Processing comment, age: %d, length: %d', age_seconds, len(comment['data']['body']))
-        futures[subreddit_name].append(executor.submit(process_text_blob, nlp, comment['data']['body']))
+        delegate = threading.Thread(target=process_text_blob,
+                                    args=(nlp, comment['data']['body'], delegator['queue']))
+        delegate.start()
+        delegator['delegates'].append(delegate)
         if comment['data']['replies']:
-            process_comment_list(comment['data']['replies'], futures, executor, nlp, stats, subreddit_name, skip_age_check=True)
+            process_comment_list(comment['data']['replies'], delegator, nlp, stats, subreddit_name, skip_age_check=True)
         stats['subreddit'][subreddit_name]['stats']['num_awards'] += int(comment['data']['total_awards_received'])
         stats['subreddit'][subreddit_name]['stats']['num_interactions'] += 1
         stats['subreddit'][subreddit_name]['stats']['num_ups'] += int(comment['data']['ups'])
         if args.dump_comments:
-            executor.submit(dump_data, comment['data'], 'comments')
+            delegate = threading.Thread(target=dump_data,
+                                        args=(comment['data'], 'comments'))
+            delegate.start()
+            delegator['delegates'].append(delegate)
     if age_seconds == None:
         logging.debug('Did not find any viable comments in: %s', payload)
-        return futures, stats, None
+        return delegator, stats, None
     if age_seconds > args.max_age:
         logging.debug('Found comment created %s seconds ago. Disabling pagination.', age_seconds)
-        return futures, stats, None
+        return delegator, stats, None
     else:
-        return futures, stats, payload['data']['after']
+        return delegator, stats, payload['data']['after']
 
-def process_post_list(payload, futures, executor, nlp, stats, subreddit_name):
+def process_post_list(payload, delegator, nlp, stats, subreddit_name):
     logging.debug('Processing %s posts', len(payload['data']['children']))
     age_seconds = None
     for post in payload['data']['children']:
@@ -176,7 +213,10 @@ def process_post_list(payload, futures, executor, nlp, stats, subreddit_name):
             break
         logging.debug('Processing post, age: %d, length: %d', age_seconds, len(post['data']['title']))
         # Glob title and text body together for entity extraction.
-        futures[subreddit_name].append(executor.submit(process_text_blob, nlp, post['data']['title'] + '. ' + post['data']['selftext']))
+        delegate = threading.Thread(target=process_text_blob,
+                                    args=(nlp, post['data']['title'] + '. ' + post['data']['selftext'], delegator['queue']))
+        delegate.start()
+        delegator['delegates'].append(delegate)
         stats['subreddit'][subreddit_name]['stats']['num_awards'] += int(post['data']['total_awards_received'])
         stats['subreddit'][subreddit_name]['stats']['num_comments'] += int(post['data']['num_comments'])
         stats['subreddit'][subreddit_name]['stats']['num_interactions'] += 1
@@ -187,17 +227,20 @@ def process_post_list(payload, futures, executor, nlp, stats, subreddit_name):
         else:
             stats['subreddit'][subreddit_name]['stats']['num_selftexts'] += 1
             if args.dump_texts:
-                executor.submit(dump_data, post['data'], 'selftexts')
+                delegate = threading.Thread(target=dump_data,
+                                            args=(post['data'], 'selftexts'))
+                delegate.start()
+                delegator['delegates'].append(delegate)
         if int(post['data']['ups']) > 100 and int(post['data']['num_comments']) > 0:
             stats['subreddit'][subreddit_name]['_tmp']['comment_candidates'].append(post['data']['permalink'])
     if age_seconds == None:
         logging.debug('Did not find any viable posts in: %s', payload)
-        return futures, stats, None
+        return delegator, stats, None
     if age_seconds > args.max_age:
         logging.debug('Found post created %s seconds ago. Disabling pagination.', age_seconds)
-        return futures, stats, None
+        return delegator, stats, None
     else:
-        return futures, stats, payload['data']['after']
+        return delegator, stats, payload['data']['after']
 
 def process_response(response, stats):
     if response.status_code in stats['script']['status_codes']:
@@ -210,9 +253,11 @@ def process_response(response, stats):
         logging.error('%s %s %s', response, response.headers, response.content)
         return None, stats
 
-def process_text_blob(nlp, blob):
+def process_text_blob(nlp, blob, queue):
     filtered_entities = []
-    if args.skip_comment_entities is False:
+    sentiment = None
+    word_stats = {}
+    if args.skip_entities is False:
         text = nlp(blob)
         # See NER: https://spacy.io/models/en#en_core_web_sm-labels
         if args.include_entity_label:
@@ -228,7 +273,17 @@ def process_text_blob(nlp, blob):
         sentiment = TextBlob(blob).sentiment
         if args.verbose:
             logging.debug('%s, entities: %s, text: %s', sentiment, text.ents, blob)
-    return blob, filtered_entities, sentiment.polarity
+    for target_word in args.word_stats:
+        matches = re.findall('[^0-9a-zA-Z]*(' + target_word + ')[^0-9a-zA-Z]*', blob)
+        num_matches = len(matches)
+        if num_matches:
+            for match in matches:
+                if match in word_stats:
+                    word_stats[match] += 1
+                else:
+                    word_stats[match] = 1
+            logging.debug('Found word: %s, %d times', target_word, num_matches)
+    queue.put((word_stats, filtered_entities, sentiment))
 
 if __name__ == '__main__':
 
@@ -236,9 +291,9 @@ if __name__ == '__main__':
     access_token_path = pathlib.Path(access_token_filename)
     access_token = None
     # Fetch new token if token file is not found or token file is older
-    # than 59 minutes. Default token expiration is 60 minutes.
+    # than 45 minutes. Default token expiration is 60 minutes.
     if (not access_token_path.exists()
-            or datetime.now(timezone.utc).timestamp() - access_token_path.stat().st_mtime > 3540):
+            or datetime.now(timezone.utc).timestamp() - access_token_path.stat().st_mtime > 2700):
         access_token_failures = 0
         while access_token is None:
             response = requests.post(
@@ -284,15 +339,17 @@ if __name__ == '__main__':
 
     # Process subreddits
     abort = False
-    executor = concurrent.futures.ProcessPoolExecutor(max_workers=args.workers)
-    futures = {}
+    delegator = {
+        'delegates': [],
+        'queue': multiprocessing.Queue(),
+    }
     stats = {
         'script': {
             'status_codes': {}},
-        'subreddit': {}
+        'subreddit': {},
     }
     for subreddit_name in args.subreddit:
-        futures[subreddit_name] = []
+        # Initialize stats map
         stats['subreddit'][subreddit_name] = {
             '_tmp': {
                 'comment_candidates': [],
@@ -301,19 +358,21 @@ if __name__ == '__main__':
             },
             'stats': copy.deepcopy(subreddit_stats_template)
         }
-        futures, stats, abort = paginate_and_process(
+        stats['subreddit'][subreddit_name]['stats']['word'] = {}
+
+        delegator, stats, abort = paginate_and_process(
             oauth_endpoint + '/r/' + subreddit_name + '/new', access_token,
-            futures, process_post_list, executor, nlp, stats, subreddit_name)
+            process_post_list, delegator, nlp, stats, subreddit_name)
         if abort is True:
             break
         # Currently, /r/[subreddit]/comments doesn't return enough comments.
-        #futures, stats, abort = paginate_and_process(
+        #delegator, stats, abort = paginate_and_process(
         #    oauth_endpoint + '/r/' + subreddit_name + '/comments', access_token,
-        #    futures, process_comment_list, executor, nlp, stats, subreddit_name)
+        #    process_comment_list, delegator, nlp, stats, subreddit_name)
         for permalink in stats['subreddit'][subreddit_name]['_tmp']['comment_candidates']:
-            futures, stats, abort = paginate_and_process(
+            delegator, stats, abort = paginate_and_process(
                 oauth_endpoint + permalink, access_token,
-                futures, process_article, executor, nlp, stats, subreddit_name,
+                process_article, delegator, nlp, stats, subreddit_name,
                 api_params_template={'depth': 100, 'limit': 100, 'showmore': 1, 'sort': 'confidence', 'threaded': 1})
             if abort is True:
                 break
@@ -323,9 +382,7 @@ if __name__ == '__main__':
         logging.error('Run aborted')
     else:
         for subreddit_name in args.subreddit:
-            logging.debug('Finalizing %s %s futures', len(futures[subreddit_name]), subreddit_name)
-            while futures[subreddit_name]:
-                stats = finalize_future(subreddit_name, futures[subreddit_name].pop(0), stats)
+            delegator, stats = join_delegates(delegator, stats, subreddit_name, block=True)
 
             stats['subreddit'][subreddit_name]['stats']['num_comment_candidates'] = len(
                 stats['subreddit'][subreddit_name]['_tmp']['comment_candidates'])
@@ -360,4 +417,4 @@ if __name__ == '__main__':
             else:
                 with open(stat_file_filename, 'a') as fd:
                     fd.write(serialized_data)
-    executor.shutdown()
+
