@@ -20,21 +20,23 @@ import time
 import traceback
 
 # TODO:
-# - Reject entities not in allow list
 # - Paginate more comments
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument('--dump-comments', action='store_true', default=False, help='dump comments to file')
 argparser.add_argument('--dump-texts', action='store_true', default=False, help='dump text posts to file')
-argparser.add_argument('--exclude-entity-label', metavar='LABEL', action='append', help='exclude specified entity types')
+argparser.add_argument('--exclude-entity-label', metavar='LABEL', action='append', default=[], help='exclude specified entity types')
 argparser.add_argument('--id', required=True, help='app client ID')
-argparser.add_argument('--include-entity-label', metavar='LABEL', action='append', help='include only specified entity types')
-argparser.add_argument('--max-age', metavar='SECONDS', type=int, default=3600*24, help='threshold for excluding posts by age')
+argparser.add_argument('--include-entity-label', metavar='LABEL', action='append', default=[], help='include only specified entity types')
+argparser.add_argument('--exclusive-word-filter', metavar='FILE', action='append', default=[], help='json file containing a simple map of acceptable values')
+argparser.add_argument('--max-age', metavar='SECONDS', type=int, default=3600*24, help='age threshold for excluding posts')
+argparser.add_argument('--min-ups', metavar='COUNT', type=int, default=25, help='upvote threshold for excluding comments')
 argparser.add_argument('--out-dir', metavar='DIRECTORY', default='/tmp/reddit_collector', help='directory for writing output')
 argparser.add_argument('--password', required=True, help='reddit development user password')
 argparser.add_argument('--secret', required=True, help='app client secret')
 argparser.add_argument('--skip-entities', action='store_true', default=False, help='skip entity analysis')
-argparser.add_argument('-w', '--word-stats', metavar='WORD', action='append', help='worg to get stats for')
+argparser.add_argument('--skip-sentiments', action='store_true', default=False, help='skip sentiment analysis')
+argparser.add_argument('-w', '--word-stats', metavar='WORD', action='append', default=[], help='worg to get stats for')
 argparser.add_argument('--user', required=True, help='reddit development user')
 argparser.add_argument('-v', '--verbose', action='store_true', default=False, help='verbose logging')
 argparser.add_argument('--workers', metavar='NUM', type=int, default=8, help='number of workers')
@@ -94,12 +96,12 @@ def dump_data(data, data_dir):
     with open(dump_file_filename, 'w') as fd:
         json.dump(data, fd)
 
-def finalize_delegate_result(subreddit_name, delegator_queue, stats):
-    word_stats, entities, sentiment_polarity = delegator_queue.get()
+def finalize_delegate_result(filters, delegator_queue, stats, subreddit_name):
+    blob, word_stats, entities, sentiment_polarity, sentiment_subjectivity = delegator_queue.get()
     # Entities
     stats['subreddit'][subreddit_name]['_tmp']['entities'] += entities
     if sentiment_polarity is None:
-        pass # entity analysis is disabled
+        pass # Entity analysis is disabled
     elif sentiment_polarity == 0:
         stats['subreddit'][subreddit_name]['stats']['num_polarity_eq_0'] += 1
     elif sentiment_polarity > 0:
@@ -108,13 +110,24 @@ def finalize_delegate_result(subreddit_name, delegator_queue, stats):
         stats['subreddit'][subreddit_name]['stats']['num_polarity_lt_0'] += 1
     # Word stats
     for match, count in word_stats.items():
-        if match in stats['subreddit'][subreddit_name]['stats']['word']:
-            stats['subreddit'][subreddit_name]['stats']['word'][match] += count
-        else:
-            stats['subreddit'][subreddit_name]['stats']['word'][match] = count
+        match_is_valid = True # Default to True
+        if filters['allow']:
+            match_is_valid = False # Set to False when filters are specified
+            for filter_map in filters['allow']:
+                if match not in filter_map:
+                    continue # Block next lines unless found
+                if len(match) == 1:
+                    logging.debug('%s: %s', match, blob)
+                match_is_valid = True
+                break
+        if match_is_valid:
+            if match in stats['subreddit'][subreddit_name]['_tmp']['words']:
+                stats['subreddit'][subreddit_name]['_tmp']['words'][match] += count
+            else:
+                stats['subreddit'][subreddit_name]['_tmp']['words'][match] = count
     return stats
 
-def join_delegates(delegator, stats, subreddit_name, block=False):
+def join_delegates(delegator, filters, stats, subreddit_name, block=False):
     num_joined = 0
     num_finalized = 0
     while delegator['delegates']:
@@ -126,12 +139,12 @@ def join_delegates(delegator, stats, subreddit_name, block=False):
             num_joined += 1
     logging.debug('Joined %d delegates', num_joined)
     while not delegator['queue'].empty():
-        stats = finalize_delegate_result(subreddit_name, delegator['queue'], stats)
+        stats = finalize_delegate_result(filters, delegator['queue'], stats, subreddit_name)
         num_finalized += 1
     logging.debug('Finalized %d results', num_finalized)
     return delegator, stats
 
-def paginate_and_process(url, access_token, hook, delegator, nlp, stats, subreddit_name,
+def paginate_and_process(url, access_token, hook, delegator, nlp, filters, stats, subreddit_name,
                          api_params_template={'limit': 100, 'show': 'all'}):
     abort = False
     after = None
@@ -149,7 +162,7 @@ def paginate_and_process(url, access_token, hook, delegator, nlp, stats, subredd
                 delegator, stats, after = hook(payload, delegator, nlp, stats, subreddit_name)
                 if after is None:
                     paginate_enabled = False
-            elif failures <= 3:
+            elif failures <= 99:
                 failures += 1
             else:
                 abort = True
@@ -157,7 +170,7 @@ def paginate_and_process(url, access_token, hook, delegator, nlp, stats, subredd
         except ratelimit.exception.RateLimitException as exc:
             if delegator['delegates']:
                 # In between API calls, join finished delegates and clear out the queue.
-                delegator, stats = join_delegates(delegator, stats, subreddit_name)
+                delegator, stats = join_delegates(delegator, filters, stats, subreddit_name)
             else:
                 time.sleep(0.1)
         except Exception as exc:
@@ -231,7 +244,7 @@ def process_post_list(payload, delegator, nlp, stats, subreddit_name):
                                             args=(post['data'], 'selftexts'))
                 delegate.start()
                 delegator['delegates'].append(delegate)
-        if int(post['data']['ups']) > 100 and int(post['data']['num_comments']) > 0:
+        if int(post['data']['ups']) > args.min_ups and int(post['data']['num_comments']) > 0:
             stats['subreddit'][subreddit_name]['_tmp']['comment_candidates'].append(post['data']['permalink'])
     if age_seconds == None:
         logging.debug('Did not find any viable posts in: %s', payload)
@@ -270,11 +283,10 @@ def process_text_blob(nlp, blob, queue):
                     filtered_entities.append((ent.text, ent.label_))
         else:
             filtered_entities = [(ent.text, ent.label_) for ent in text.ents]
+    if args.skip_sentiments is False:
         sentiment = TextBlob(blob).sentiment
-        if args.verbose:
-            logging.debug('%s, entities: %s, text: %s', sentiment, text.ents, blob)
-    for target_word in args.word_stats:
-        matches = re.findall('[^0-9a-zA-Z]*(' + target_word + ')[^0-9a-zA-Z]*', blob)
+    for target_expr in args.word_stats:
+        matches = re.findall('(?:^|[^0-9a-zA-Z])(' + target_expr + ')(?:[^0-9a-zA-Z]|$)', blob)
         num_matches = len(matches)
         if num_matches:
             for match in matches:
@@ -282,8 +294,11 @@ def process_text_blob(nlp, blob, queue):
                     word_stats[match] += 1
                 else:
                     word_stats[match] = 1
-            logging.debug('Found word: %s, %d times', target_word, num_matches)
-    queue.put((word_stats, filtered_entities, sentiment))
+            logging.debug('Found word: %s, %d times', target_expr, num_matches)
+    queue.put((
+        blob, word_stats, filtered_entities,
+        None if sentiment is None else sentiment.polarity,
+        None if sentiment is None else sentiment.subjectivity))
 
 if __name__ == '__main__':
 
@@ -334,6 +349,14 @@ if __name__ == '__main__':
         if not selftext_path.exists():
             selftext_path.mkdir(parents=True)
 
+    # Load filter files
+    filters = {'allow': []}
+    for filter_filename in args.exclusive_word_filter:
+        filter_path = pathlib.Path(filter_filename)
+        if filter_path.exists():
+            with filter_path.open() as fd:
+                filters['allow'].append(json.load(fd))
+
     nlp = spacy.load('en_core_web_sm')
     logging.debug("Pipeline: %s", nlp.pipe_names)
 
@@ -355,24 +378,24 @@ if __name__ == '__main__':
                 'comment_candidates': [],
                 'entities': [],
                 'more_comments': [],
+                'words': {},
             },
             'stats': copy.deepcopy(subreddit_stats_template)
         }
-        stats['subreddit'][subreddit_name]['stats']['word'] = {}
 
         delegator, stats, abort = paginate_and_process(
             oauth_endpoint + '/r/' + subreddit_name + '/new', access_token,
-            process_post_list, delegator, nlp, stats, subreddit_name)
+            process_post_list, delegator, nlp, filters, stats, subreddit_name)
         if abort is True:
             break
         # Currently, /r/[subreddit]/comments doesn't return enough comments.
         #delegator, stats, abort = paginate_and_process(
         #    oauth_endpoint + '/r/' + subreddit_name + '/comments', access_token,
-        #    process_comment_list, delegator, nlp, stats, subreddit_name)
+        #    process_comment_list, delegator, nlp, filters, stats, subreddit_name)
         for permalink in stats['subreddit'][subreddit_name]['_tmp']['comment_candidates']:
             delegator, stats, abort = paginate_and_process(
                 oauth_endpoint + permalink, access_token,
-                process_article, delegator, nlp, stats, subreddit_name,
+                process_article, delegator, nlp, filters, stats, subreddit_name,
                 api_params_template={'depth': 100, 'limit': 100, 'showmore': 1, 'sort': 'confidence', 'threaded': 1})
             if abort is True:
                 break
@@ -382,7 +405,7 @@ if __name__ == '__main__':
         logging.error('Run aborted')
     else:
         for subreddit_name in args.subreddit:
-            delegator, stats = join_delegates(delegator, stats, subreddit_name, block=True)
+            delegator, stats = join_delegates(delegator, filters, stats, subreddit_name, block=True)
 
             stats['subreddit'][subreddit_name]['stats']['num_comment_candidates'] = len(
                 stats['subreddit'][subreddit_name]['_tmp']['comment_candidates'])
@@ -395,6 +418,9 @@ if __name__ == '__main__':
 
             stats['subreddit'][subreddit_name]['stats']['top_entities'] = Counter(
                 stats['subreddit'][subreddit_name]['_tmp']['entities']).most_common()[:50]
+            stats['subreddit'][subreddit_name]['stats']['top_word_matches'] = Counter(
+                stats['subreddit'][subreddit_name]['_tmp']['words']).most_common()[:50]
+
             del stats['subreddit'][subreddit_name]['_tmp']
 
         logging.debug('Script stats:\n%s', pprint.pformat(stats['script']))
