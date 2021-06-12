@@ -51,9 +51,9 @@ subreddit_stats_template = {
     'num_comment_candidates': 0,
     'num_comments': 0,
     'num_interactions': 0,
-    'num_polarity_eq_0': 0,
-    'num_polarity_gt_0': 0,
-    'num_polarity_lt_0': 0,
+    'num_negative': 0,
+    'num_neutral': 0,
+    'num_positive': 0,
     'num_posts': 0,
     'num_selftexts': 0,
     'num_ups': 0,
@@ -74,12 +74,12 @@ logging.basicConfig(
     encoding='utf-8',
     filename=(args.out_dir + '/reddit_collector.log'),
     format='%(levelname)s\t%(asctime)s\t%(message)s',
-    level=logging.DEBUG)
+    level=logging.INFO)
 
 # Reddit requires capping requests at 1 rps.
 # https://github.com/reddit-archive/reddit/wiki/API#rules
 @ratelimit.limits(calls=1, period=1)
-def do_get(api_url, access_token, api_params={}):
+def do_get(api_url, access_token, api_params={}, timeout=10):
     response = requests.get(
         url=api_url,
         params=api_params,
@@ -97,17 +97,17 @@ def dump_data(data, data_dir):
         json.dump(data, fd)
 
 def finalize_delegate_result(filters, delegator_queue, stats, subreddit_name):
-    blob, word_stats, entities, sentiment_polarity, sentiment_subjectivity = delegator_queue.get()
+    blob, word_stats, entities, polarity, subjectivity = delegator_queue.get()
     # Entities
     stats['subreddit'][subreddit_name]['_tmp']['entities'] += entities
-    if sentiment_polarity is None:
+    if polarity is None:
         pass # Entity analysis is disabled
-    elif sentiment_polarity == 0:
-        stats['subreddit'][subreddit_name]['stats']['num_polarity_eq_0'] += 1
-    elif sentiment_polarity > 0:
-        stats['subreddit'][subreddit_name]['stats']['num_polarity_gt_0'] += 1
+    elif polarity == 0:
+        stats['subreddit'][subreddit_name]['stats']['num_neutral'] += 1
+    elif polarity > 0:
+        stats['subreddit'][subreddit_name]['stats']['num_positive'] += 1
     else:
-        stats['subreddit'][subreddit_name]['stats']['num_polarity_lt_0'] += 1
+        stats['subreddit'][subreddit_name]['stats']['num_negative'] += 1
     # Word stats
     for match, count in word_stats.items():
         match_is_valid = True # Default to True
@@ -116,15 +116,34 @@ def finalize_delegate_result(filters, delegator_queue, stats, subreddit_name):
             for filter_map in filters['allow']:
                 if match not in filter_map:
                     continue # Block next lines unless found
-                if len(match) == 1:
-                    logging.debug('%s: %s', match, blob)
+                #if len(match) == 1:
+                #    logging.debug('%s: %s', match, blob)
                 match_is_valid = True
                 break
         if match_is_valid:
-            if match in stats['subreddit'][subreddit_name]['_tmp']['words']:
-                stats['subreddit'][subreddit_name]['_tmp']['words'][match] += count
+            if match in stats['subreddit'][subreddit_name]['_tmp']['words']['num_total']:
+                stats['subreddit'][subreddit_name]['_tmp']['words']['num_total'][match] += count
+                stats['subreddit'][subreddit_name]['_tmp']['words']['num_interactions'][match] += 1
             else:
-                stats['subreddit'][subreddit_name]['_tmp']['words'][match] = count
+                stats['subreddit'][subreddit_name]['_tmp']['words']['num_total'][match] = count
+                stats['subreddit'][subreddit_name]['_tmp']['words']['num_interactions'][match] = 1
+            if polarity is None:
+                pass
+            if polarity == 0:
+                if match in stats['subreddit'][subreddit_name]['_tmp']['words']['num_neutral_interactions']:
+                    stats['subreddit'][subreddit_name]['_tmp']['words']['num_neutral_interactions'][match] += 1
+                else:
+                    stats['subreddit'][subreddit_name]['_tmp']['words']['num_neutral_interactions'][match] = 1
+            elif polarity > 0:
+                if match in stats['subreddit'][subreddit_name]['_tmp']['words']['num_positive_interactions']:
+                    stats['subreddit'][subreddit_name]['_tmp']['words']['num_positive_interactions'][match] += 1
+                else:
+                    stats['subreddit'][subreddit_name]['_tmp']['words']['num_positive_interactions'][match] = 1
+            else:
+                if match in stats['subreddit'][subreddit_name]['_tmp']['words']['num_negative_interactions']:
+                    stats['subreddit'][subreddit_name]['_tmp']['words']['num_negative_interactions'][match] += 1
+                else:
+                    stats['subreddit'][subreddit_name]['_tmp']['words']['num_negative_interactions'][match] = 1
     return stats
 
 def join_delegates(delegator, filters, stats, subreddit_name, block=False):
@@ -378,7 +397,13 @@ if __name__ == '__main__':
                 'comment_candidates': [],
                 'entities': [],
                 'more_comments': [],
-                'words': {},
+                'words': {
+                    'num_total': {},
+                    'num_interactions': {},
+                    'num_negative_interactions': {},
+                    'num_neutral_interactions': {},
+                    'num_positive_interactions': {},
+                },
             },
             'stats': copy.deepcopy(subreddit_stats_template)
         }
@@ -404,6 +429,8 @@ if __name__ == '__main__':
     if abort is True:
         logging.error('Run aborted')
     else:
+        logging.info('Script stats:\n%s', stats['script'])
+
         for subreddit_name in args.subreddit:
             delegator, stats = join_delegates(delegator, filters, stats, subreddit_name, block=True)
 
@@ -412,19 +439,76 @@ if __name__ == '__main__':
 
             if stats['subreddit'][subreddit_name]['stats']['num_interactions'] > 0:
                 stats['subreddit'][subreddit_name]['stats']['negative_polarity_ratio'] = (
-                    stats['subreddit'][subreddit_name]['stats']['num_polarity_lt_0'] / stats['subreddit'][subreddit_name]['stats']['num_interactions'])
+                    stats['subreddit'][subreddit_name]['stats']['num_negative'] / stats['subreddit'][subreddit_name]['stats']['num_interactions'])
                 stats['subreddit'][subreddit_name]['stats']['positive_polarity_ratio'] = (
-                    stats['subreddit'][subreddit_name]['stats']['num_polarity_gt_0'] / stats['subreddit'][subreddit_name]['stats']['num_interactions'])
+                    stats['subreddit'][subreddit_name]['stats']['num_positive'] / stats['subreddit'][subreddit_name]['stats']['num_interactions'])
 
             stats['subreddit'][subreddit_name]['stats']['top_entities'] = Counter(
                 stats['subreddit'][subreddit_name]['_tmp']['entities']).most_common()[:50]
-            stats['subreddit'][subreddit_name]['stats']['top_word_matches'] = Counter(
-                stats['subreddit'][subreddit_name]['_tmp']['words']).most_common()[:50]
+            stats['subreddit'][subreddit_name]['stats']['top_word_by_num_total'] = Counter(
+                stats['subreddit'][subreddit_name]['_tmp']['words']['num_total']).most_common()[:50]
+            stats['subreddit'][subreddit_name]['stats']['top_word_by_num_interactions'] = Counter(
+                stats['subreddit'][subreddit_name]['_tmp']['words']['num_interactions']).most_common()[:50]
+            stats['subreddit'][subreddit_name]['stats']['top_word_by_num_negative_interactions'] = Counter(
+                stats['subreddit'][subreddit_name]['_tmp']['words']['num_negative_interactions']).most_common()[:50]
+            stats['subreddit'][subreddit_name]['stats']['top_word_by_num_neutral_interactions'] = Counter(
+                stats['subreddit'][subreddit_name]['_tmp']['words']['num_neutral_interactions']).most_common()[:50]
+            stats['subreddit'][subreddit_name]['stats']['top_word_by_num_positive_interactions'] = Counter(
+                stats['subreddit'][subreddit_name]['_tmp']['words']['num_positive_interactions']).most_common()[:50]
+
+            for stat_name in ['top_word_by_num_negative_interactions',
+                              'top_word_by_num_neutral_interactions',
+                              'top_word_by_num_positive_interactions']:
+                stat_file_filename = args.out_dir + '/' + subreddit_name + '.' + stat_name + '.tsv'
+                logging.info('Generating %s stats in %s', stat_name, stat_file_filename)
+
+                column_names = ['timestamp']
+                rows = []
+                # Load previous rows
+                if pathlib.Path(stat_file_filename).exists():
+                    with open(stat_file_filename) as fd:
+                        tokens = fd.readline().strip().split('\t')
+                        if tokens.pop(0) != 'timestamp':
+                            logging.error('Unexpectd TSV format: %s', stat_file_filename)
+                        else:
+                            for token in tokens:
+                                column_names.append(token)
+                            for line in fd:
+                                rows.append(line.strip().split('\t'))
+                #logging.debug('Old: %s', column_names)
+                #logging.debug('Old: %s', rows)
+
+                new_row = [datetime.now(timezone.utc).strftime('%m/%d/%Y %H:%M:%S')]
+                for word, num in stats['subreddit'][subreddit_name]['stats'][stat_name]:
+                    #logging.debug('Word: %s, num: %s', word, num)
+                    if word not in column_names:
+                        # Append name and 0s for each previous row
+                        column_names.append(word)
+                        for row in rows:
+                            row.append('0')
+                    idx = column_names.index(word)
+                    new_row_size = len(new_row)
+                    if new_row_size == idx: # Just enough elements before
+                        new_row.append(str(num))
+                    elif new_row_size < idx: # Need to pad missing values before appending
+                        diff = idx - new_row_size
+                        new_row += ['0' for _ in range(1, diff + 1)]
+                        new_row.append(str(num))
+                    else: # Replace at idx
+                        new_row[idx] = str(num)
+                rows.append(new_row)
+                #logging.debug('New: %s', column_names)
+                #logging.debug('New: %s', rows)
+
+                with open(stat_file_filename, 'w') as fd:
+                    fd.write('\t'.join(column_names) + '\n')
+                    for row in rows:
+                        fd.write('\t'.join(row) + '\n')
 
             del stats['subreddit'][subreddit_name]['_tmp']
 
-        logging.debug('Script stats:\n%s', pprint.pformat(stats['script']))
-        logging.debug('Subreddit stats:\n%s', pprint.pformat(stats['subreddit']))
+        logging.debug('Subreddit stats:\n%s', pprint.PrettyPrinter(width=160).pformat(stats['subreddit']))
+
         sorted_subreddits = sorted(stats['subreddit'].keys())
         for stat_name in subreddit_stats_template.keys():
             stat_file_filename = args.out_dir + '/subreddit.' + stat_name + '.tsv'
@@ -436,11 +520,18 @@ if __name__ == '__main__':
             serialized_data = '\t'.join([datetime.now(timezone.utc).strftime('%m/%d/%Y %H:%M:%S')] + [str(value) for value in data]) + '\n'
 
             stat_file_path = pathlib.Path(stat_file_filename)
+            write_new_file = False
             if not stat_file_path.exists() or stat_file_path.stat().st_size == 0:
+                write_new_file = True
+            else:
+                with open(stat_file_filename) as fd:
+                    if len(fd.readline().strip().split('\t')) != len(sorted_subreddits) + 1:
+                        write_new_file = True
+
+            if write_new_file:
                 with open(stat_file_filename, 'w') as fd:
                     fd.write('\t'.join(['timestamp'] + sorted_subreddits) + '\n')
                     fd.write(serialized_data)
             else:
                 with open(stat_file_filename, 'a') as fd:
                     fd.write(serialized_data)
-
